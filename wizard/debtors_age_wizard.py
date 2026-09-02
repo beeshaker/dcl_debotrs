@@ -5,9 +5,9 @@ import math
 import os
 import tempfile
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
-from odoo import api, fields, models, _
+from odoo import fields, models, _
 from odoo.exceptions import UserError, ValidationError
 
 try:
@@ -27,6 +27,9 @@ from ..models.aging_engine import (
 )
 
 
+BUILD_VERSION = "2026.09.02-r6"
+
+
 class DclDebtorsAgeWizard(models.TransientModel):
     _name = "dcl.debtors.age.wizard"
     _description = "DCL Debtors Age Analysis"
@@ -37,7 +40,7 @@ class DclDebtorsAgeWizard(models.TransientModel):
         string="Reporting Date",
         required=True,
         default=fields.Date.context_today,
-        help="The 'as at' date for the age analysis. The month/year is used for the current ageing period.",
+        help="The 'as at' date for the age analysis. The month/year should match the latest month in the source file.",
     )
     source_sheet = fields.Char(
         string="Source Sheet",
@@ -59,25 +62,24 @@ class DclDebtorsAgeWizard(models.TransientModel):
         readonly=True,
     )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Public actions
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def action_generate(self):
         self.ensure_one()
 
         if not self.source_file:
             raise ValidationError(_("Please upload the source Debtors List Excel file."))
-
         if openpyxl is None:
             raise UserError(_("Python dependency 'openpyxl' is not installed."))
         if xlsxwriter is None:
             raise UserError(_("Python dependency 'xlsxwriter' is not installed."))
 
+        workbook = None
         try:
             workbook = self._load_workbook()
             worksheet = self._select_sheet(workbook)
-
             parsed = self._read_source(worksheet)
 
             if not parsed["rows"]:
@@ -85,27 +87,30 @@ class DclDebtorsAgeWizard(models.TransientModel):
                     _("No debtor rows were found in worksheet '%s'.") % worksheet.title
                 )
 
+            self._validate_reporting_period(parsed["months"])
+
+            # Release the uploaded workbook before rendering the output.
+            try:
+                workbook.close()
+            finally:
+                workbook = None
+
             result_bytes = self._build_xlsx(parsed)
 
             total_receivables = sum(
                 float(row.get("current_outstanding") or 0.0)
                 for row in parsed["rows"]
             )
-
             exception_count = sum(
                 1 for row in parsed["rows"] if row.get("exception")
             )
-
             property_names = {
                 row.get("property") or "Unassigned"
                 for row in parsed["rows"]
             }
 
-            filename = "Debtors_Age_Analysis_%s.xlsx" % (
-                self.reporting_date.strftime("%Y-%m-%d")
-                if self.reporting_date
-                else fields.Date.today().strftime("%Y-%m-%d")
-            )
+            report_date = self.reporting_date or fields.Date.today()
+            filename = "Debtors_Age_Analysis_%s.xlsx" % report_date.strftime("%Y-%m-%d")
 
             self.write({
                 "result_file": base64.b64encode(result_bytes),
@@ -116,11 +121,14 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "total_receivables": total_receivables,
                 "status_message": _(
                     "Age analysis generated successfully from worksheet '%s'. "
-                    "%s debtors across %s properties were processed."
+                    "%s debtors across %s properties were processed. "
+                    "%s reconciliation exceptions require review. Build %s."
                 ) % (
-                    worksheet.title,
+                    parsed["sheet_name"],
                     len(parsed["rows"]),
                     len(property_names),
+                    exception_count,
+                    BUILD_VERSION,
                 ),
             })
 
@@ -133,18 +141,22 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "target": "new",
             }
 
-        except UserError:
-            raise
-        except ValidationError:
+        except (UserError, ValidationError):
             raise
         except Exception as exc:
             raise UserError(
-                _("Unable to generate the age analysis.\n\n%s") % str(exc)
+                _("Unable to generate the age analysis.\n\n%s\n\nBuild: %s")
+                % (str(exc), BUILD_VERSION)
             ) from exc
+        finally:
+            if workbook is not None:
+                try:
+                    workbook.close()
+                except Exception:
+                    pass
 
     def action_download(self):
         self.ensure_one()
-
         if not self.result_file:
             raise UserError(_("Generate the age analysis before downloading."))
 
@@ -158,9 +170,9 @@ class DclDebtorsAgeWizard(models.TransientModel):
             "target": "self",
         }
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Workbook loading / source discovery
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _load_workbook(self):
         payload = base64.b64decode(self.source_file)
@@ -171,13 +183,54 @@ class DclDebtorsAgeWizard(models.TransientModel):
         )
 
     @staticmethod
-    def _row_values(ws, row_number):
-        """
-        Read one row sequentially.
+    def _parse_month_value(value):
+        """Parse text, Excel dates, date objects and Excel serial month markers."""
+        if value in (None, ""):
+            return None
 
-        With openpyxl read_only=True we intentionally avoid thousands of
-        ws.cell(row, col) calls. Sequential iteration is dramatically faster.
-        """
+        if isinstance(value, datetime):
+            return value.date().replace(day=1)
+        if isinstance(value, date):
+            return value.replace(day=1)
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                serial = float(value)
+                if 20000 <= serial <= 80000:
+                    parsed = date(1899, 12, 30) + timedelta(days=int(serial))
+                    return parsed.replace(day=1)
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        cleaned = " ".join(
+            text.replace(".", " ").replace(",", " ").split()
+        )
+        for fmt in (
+            "%B %Y", "%b %Y", "%Y-%m", "%m/%Y",
+            "%m-%Y", "%B-%Y", "%b-%Y",
+        ):
+            try:
+                return datetime.strptime(cleaned, fmt).date().replace(day=1)
+            except ValueError:
+                continue
+
+        try:
+            parsed = parse_month(value)
+            if parsed:
+                if isinstance(parsed, datetime):
+                    parsed = parsed.date()
+                return parsed.replace(day=1)
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _row_values(ws, row_number):
         for row in ws.iter_rows(
             min_row=row_number,
             max_row=row_number,
@@ -187,44 +240,37 @@ class DclDebtorsAgeWizard(models.TransientModel):
         return tuple()
 
     def _score_sheet(self, ws):
-        """
-        Score a sheet based on month headers / ledger labels in its first rows.
-        This only touches the first few rows, so it remains cheap.
-        """
         first = self._row_values(ws, 1)
         second = self._row_values(ws, 2)
+        score = 0.0
 
-        score = 0
-
-        for value in first:
-            if parse_month(value):
+        for value in list(first) + list(second):
+            if self._parse_month_value(value):
                 score += 4
 
         expected = {
-            "arrears b f",
-            "rent levy",
+            "arrears_bf",
+            "rent_levy",
             "recoveries",
             "adjustments",
             "receipts",
-            "current bal",
-            "opening balance",
-            "total billings",
-            "total receipts",
-            "closing balance",
+            "current_bal",
+            "opening_balance",
+            "total_billings",
+            "total_receipts",
+            "closing_balance",
         }
-
         for value in list(first) + list(second):
-            header = normalize_header(value)
-            if header in expected:
+            if normalize_header(value) in expected:
                 score += 2
 
+        # Prefer the richer worksheet when two sheets contain the same ledger.
         score += min(ws.max_column or 0, 100) / 100.0
         score += min(ws.max_row or 0, 10000) / 10000.0
         return score
 
     def _select_sheet(self, workbook):
         requested = (self.source_sheet or "").strip()
-
         if requested:
             if requested not in workbook.sheetnames:
                 raise UserError(
@@ -235,24 +281,20 @@ class DclDebtorsAgeWizard(models.TransientModel):
 
         candidates = [(self._score_sheet(ws), ws) for ws in workbook.worksheets]
         candidates.sort(key=lambda item: item[0], reverse=True)
-
         if not candidates or candidates[0][0] <= 0:
             raise UserError(_("Could not identify the debtors ledger worksheet."))
-
         return candidates[0][1]
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Source parser
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _safe_number(value):
         if value in (None, ""):
             return 0.0
-
         if isinstance(value, bool):
             return float(value)
-
         if isinstance(value, (int, float)):
             if isinstance(value, float) and math.isnan(value):
                 return 0.0
@@ -261,114 +303,110 @@ class DclDebtorsAgeWizard(models.TransientModel):
         text = str(value).strip()
         if not text:
             return 0.0
-
         text = text.replace(",", "")
         text = text.replace("(", "-").replace(")", "")
         text = text.replace("KES", "").strip()
-
         try:
             return float(text)
         except (TypeError, ValueError):
             return 0.0
 
     @staticmethod
+    def _has_value(value):
+        return value not in (None, "")
+
+    @staticmethod
     def _text(value):
-        if value is None:
-            return ""
-        return str(value).strip()
+        return "" if value is None else str(value).strip()
 
     def _build_column_map(self, header1, header2):
         """
-        Build all column indexes once from the two header rows.
-
-        Returns:
-            {
-                "months": {
-                    date(2026, 8, 1): {
-                        "arrears": 3,
-                        "rent": 4,
-                        ...
-                    }
-                },
-                "summary": {
-                    "opening_balance": 52,
-                    ...
-                }
-            }
-
-        Indexes are zero-based because rows are tuples.
+        Source layout confirmed against the supplied August workbook:
+        row 1 = transaction headings; row 2 = month marker at each block start.
         """
         months = {}
         summary = {}
-
         current_month = None
 
         field_aliases = {
-            "arrears b f": "arrears",
-            "arrears bf": "arrears",
-            "arrears b/f": "arrears",
-            "rent levy": "rent_levy",
-            "rent / levy": "rent_levy",
+            "arrears_bf": "arrears",
+            "rent_levy": "rent_levy",
             "recoveries": "recoveries",
             "adjustments": "adjustments",
             "receipts": "receipts",
-            "current bal": "current_balance",
-            "current balance": "current_balance",
+            "current_bal": "current_bal",
+            "current_balance": "current_bal",
         }
-
         summary_aliases = {
-            "opening balance": "opening_balance",
-            "total billings": "total_billings",
-            "total receipts": "total_receipts",
-            "closing balance": "closing_balance",
+            "opening_balance": "opening_balance",
+            "total_billings": "total_billings",
+            "total_receipts": "total_receipts",
+            "closing_balance": "closing_balance",
         }
 
         width = max(len(header1), len(header2))
-
         for idx in range(width):
             top = header1[idx] if idx < len(header1) else None
-            sub = header2[idx] if idx < len(header2) else None
+            bottom = header2[idx] if idx < len(header2) else None
 
-            parsed_month = parse_month(top)
-            if parsed_month:
-                current_month = parsed_month.replace(day=1)
+            month = self._parse_month_value(bottom) or self._parse_month_value(top)
+            if month:
+                current_month = month.replace(day=1)
+                months.setdefault(current_month, {})
 
             top_norm = normalize_header(top)
-            sub_norm = normalize_header(sub)
+            bottom_norm = normalize_header(bottom)
 
             if top_norm in summary_aliases:
                 summary[summary_aliases[top_norm]] = idx
-            if sub_norm in summary_aliases:
-                summary[summary_aliases[sub_norm]] = idx
+            if bottom_norm in summary_aliases:
+                summary[summary_aliases[bottom_norm]] = idx
 
-            field_name = field_aliases.get(sub_norm) or field_aliases.get(top_norm)
-
+            field_name = field_aliases.get(top_norm) or field_aliases.get(bottom_norm)
             if current_month and field_name:
                 months.setdefault(current_month, {})[field_name] = idx
 
-        return {
-            "months": dict(sorted(months.items())),
-            "summary": summary,
+        required_fields = {
+            "arrears", "rent_levy", "recoveries",
+            "adjustments", "receipts", "current_bal",
         }
+        valid_months = {}
+        for month, columns in months.items():
+            # A valid Dunhill month block should contain all six fields.
+            if required_fields.issubset(columns.keys()):
+                valid_months[month] = columns
+
+        valid_months = dict(sorted(valid_months.items()))
+        if not valid_months:
+            debug_values = []
+            for idx in range(width):
+                top = header1[idx] if idx < len(header1) else None
+                bottom = header2[idx] if idx < len(header2) else None
+                if top not in (None, "") or bottom not in (None, ""):
+                    debug_values.append(
+                        "%s: [%r] / [%r]" % (idx + 1, top, bottom)
+                    )
+            raise UserError(
+                _(
+                    "Monthly columns could not be detected.\n\n"
+                    "Detected headers:\n%s\n\nBuild: %s"
+                ) % ("\n".join(debug_values[:80]), BUILD_VERSION)
+            )
+
+        return {"months": valid_months, "summary": summary}
 
     def _detect_identity_columns(self, header1, header2):
-        """
-        Detect the important non-month columns conservatively.
-        Falls back to the known source layout if headings are not explicit.
-        """
         combined = []
         width = max(len(header1), len(header2))
-
         for idx in range(width):
-            text = " ".join(
+            combined.append(" ".join(
                 part
                 for part in [
                     normalize_header(header1[idx] if idx < len(header1) else None),
                     normalize_header(header2[idx] if idx < len(header2) else None),
                 ]
                 if part
-            )
-            combined.append(text)
+            ))
 
         def find_index(words, default):
             for idx, text in enumerate(combined):
@@ -376,41 +414,25 @@ class DclDebtorsAgeWizard(models.TransientModel):
                     return idx
             return default
 
-        # Source workbook is known to use account/debtor ID in column A.
-        account_idx = find_index(
-            ["debtor id", "account id", "customer id", "tenant id", "code"],
-            0,
-        )
-        name_idx = find_index(
-            ["debtor name", "customer name", "tenant name", "client name", "name"],
-            1,
-        )
-        property_idx = find_index(
-            ["property", "site", "building", "estate", "project"],
-            2,
-        )
-
         return {
-            "account_id": account_idx,
-            "name": name_idx,
-            "property": property_idx,
+            "account_id": find_index(
+                ["debtor_id", "account_id", "customer_id", "tenant_id", "code"], 0
+            ),
+            "name": find_index(
+                ["debtor_name", "customer_name", "tenant_name", "client_name", "tenant"], 1
+            ),
+            # Property heading is blank in the supplied workbook, so C is the safe fallback.
+            "property": find_index(
+                ["property", "site", "building", "estate", "project"], 2
+            ),
         }
 
     def _read_source(self, ws):
-        """
-        Fast source reader.
-
-        The key performance change is that the worksheet is consumed once with
-        iter_rows(values_only=True). We do not use ws.cell() inside the debtor
-        loop.
-        """
         row_iterator = ws.iter_rows(values_only=True)
-
         try:
             header1 = tuple(next(row_iterator))
         except StopIteration:
             raise UserError(_("The selected worksheet is empty."))
-
         try:
             header2 = tuple(next(row_iterator))
         except StopIteration:
@@ -419,15 +441,7 @@ class DclDebtorsAgeWizard(models.TransientModel):
         column_map = self._build_column_map(header1, header2)
         month_blocks = column_map["months"]
         summary_columns = column_map["summary"]
-
-        if not month_blocks:
-            raise UserError(
-                _("No monthly ledger blocks could be detected in worksheet '%s'.")
-                % ws.title
-            )
-
         identity = self._detect_identity_columns(header1, header2)
-
         rows = []
 
         def cell(row_tuple, idx):
@@ -440,86 +454,86 @@ class DclDebtorsAgeWizard(models.TransientModel):
             debtor_name = self._text(cell(row_tuple, identity["name"]))
             property_name = self._text(cell(row_tuple, identity["property"]))
 
-            # Skip headings/totals/blank lines.
             if not account_id and not debtor_name:
                 continue
 
             joined_identity = " ".join(
                 [account_id.lower(), debtor_name.lower(), property_name.lower()]
             )
-            if any(
-                marker in joined_identity
-                for marker in (
-                    "grand total",
-                    "portfolio total",
-                    "property total",
-                    "subtotal",
-                )
-            ):
+            if any(marker in joined_identity for marker in (
+                "grand total", "portfolio total", "property total", "subtotal"
+            )):
                 continue
 
             monthly_rows = []
-
             for month, cols in month_blocks.items():
                 monthly_rows.append({
                     "month": month,
-                    "arrears_bf": self._safe_number(
-                        cell(row_tuple, cols.get("arrears"))
-                    ),
-                    "rent_levy": self._safe_number(
-                        cell(row_tuple, cols.get("rent_levy"))
-                    ),
-                    "recoveries": self._safe_number(
-                        cell(row_tuple, cols.get("recoveries"))
-                    ),
-                    "adjustments": self._safe_number(
-                        cell(row_tuple, cols.get("adjustments"))
-                    ),
-                    "receipts": self._safe_number(
-                        cell(row_tuple, cols.get("receipts"))
-                    ),
-                    "current_balance": self._safe_number(
-                        cell(row_tuple, cols.get("current_balance"))
-                    ),
+                    "arrears_bf": self._safe_number(cell(row_tuple, cols["arrears"])),
+                    "rent_levy": self._safe_number(cell(row_tuple, cols["rent_levy"])),
+                    "recoveries": self._safe_number(cell(row_tuple, cols["recoveries"])),
+                    "adjustments": self._safe_number(cell(row_tuple, cols["adjustments"])),
+                    "receipts": self._safe_number(cell(row_tuple, cols["receipts"])),
+                    "current_bal": self._safe_number(cell(row_tuple, cols["current_bal"])),
                 })
 
-            source_opening = self._safe_number(
-                cell(row_tuple, summary_columns.get("opening_balance"))
-            )
-            source_billings = self._safe_number(
-                cell(row_tuple, summary_columns.get("total_billings"))
-            )
-            source_receipts = self._safe_number(
-                cell(row_tuple, summary_columns.get("total_receipts"))
-            )
-            source_closing = self._safe_number(
-                cell(row_tuple, summary_columns.get("closing_balance"))
-            )
+            # The supplied enhanced sheet has summary headings BA:BD but the debtor
+            # rows are blank there. Therefore, only use those cells when populated.
+            raw_opening = cell(row_tuple, summary_columns.get("opening_balance"))
+            raw_billings = cell(row_tuple, summary_columns.get("total_billings"))
+            raw_receipts = cell(row_tuple, summary_columns.get("total_receipts"))
+            raw_closing = cell(row_tuple, summary_columns.get("closing_balance"))
 
-            # If summary columns were unavailable, use the latest period balance.
-            if "closing_balance" not in summary_columns and monthly_rows:
-                source_closing = monthly_rows[-1]["current_balance"]
+            source_closing = (
+                self._safe_number(raw_closing)
+                if self._has_value(raw_closing)
+                else float(monthly_rows[-1]["current_bal"] or 0.0)
+            )
 
             calculation = calculate_debtor_ageing(
-                opening_balance=source_opening,
+                debtor_id=account_id,
+                debtor_name=debtor_name,
+                property_name=property_name or "Unassigned",
                 monthly_rows=monthly_rows,
-                source_closing_balance=source_closing,
+                source_closing=source_closing,
+            )
+
+            opening_balance = (
+                self._safe_number(raw_opening)
+                if self._has_value(raw_opening)
+                else calculation.opening_balance
+            )
+            period_charges = (
+                self._safe_number(raw_billings)
+                if self._has_value(raw_billings)
+                else calculation.period_charges
+            )
+            # Source receipts are stored as negative movements. The report displays
+            # collections as a positive amount, matching the reference report label.
+            period_receipts = (
+                self._safe_number(raw_receipts)
+                if self._has_value(raw_receipts)
+                else -calculation.period_receipts
+            )
+
+            reconciliation_difference = (
+                float(calculation.calculated_outstanding or 0.0)
+                - float(calculation.current_outstanding or 0.0)
             )
 
             rows.append({
-                "account_id": account_id,
-                "debtor_name": debtor_name,
-                "property": property_name or "Unassigned",
-                "billing_frequency": calculation.get("billing_frequency", ""),
-                "opening_balance": source_opening,
-                "total_billings": source_billings,
-                "total_receipts": source_receipts,
-                "current_outstanding": source_closing,
-                "ageing": calculation.get("ageing", {}),
-                "reconciliation_difference": calculation.get(
-                    "reconciliation_difference", 0.0
-                ),
-                "exception": bool(calculation.get("exception")),
+                "account_id": calculation.debtor_id,
+                "debtor_name": calculation.debtor_name,
+                "property": calculation.property_name or "Unassigned",
+                "billing_frequency": calculation.billing_frequency,
+                "opening_balance": opening_balance,
+                "period_charges": period_charges,
+                "period_receipts": period_receipts,
+                "current_outstanding": calculation.current_outstanding,
+                "ageing": calculation.aged,
+                "reconciliation_difference": reconciliation_difference,
+                "exception": bool(calculation.exception),
+                "exception_message": calculation.exception or "",
             })
 
         return {
@@ -528,35 +542,45 @@ class DclDebtorsAgeWizard(models.TransientModel):
             "sheet_name": ws.title,
         }
 
-    # -------------------------------------------------------------------------
+    def _validate_reporting_period(self, months):
+        if not months or not self.reporting_date:
+            return
+        latest = max(months)
+        if (latest.year, latest.month) != (
+            self.reporting_date.year,
+            self.reporting_date.month,
+        ):
+            raise ValidationError(
+                _(
+                    "Reporting Date does not match the latest source month. "
+                    "The source ends in %s, but the Reporting Date is %s."
+                ) % (
+                    latest.strftime("%B %Y"),
+                    self.reporting_date.strftime("%d %B %Y"),
+                )
+            )
+
+    # ------------------------------------------------------------------
     # XLSX generation
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _safe_sheet_name(name, used):
         invalid = '[]:*?/\\'
-        cleaned = "".join("_" if char in invalid else char for char in (name or "Property"))
-        cleaned = cleaned.strip() or "Property"
+        cleaned = "".join(
+            "_" if char in invalid else char for char in (name or "Property")
+        ).strip() or "Property"
         cleaned = cleaned[:31]
-
         base = cleaned
         suffix = 1
-
         while cleaned.lower() in used:
             suffix += 1
             tag = "_%s" % suffix
             cleaned = (base[: 31 - len(tag)] + tag)[:31]
-
         used.add(cleaned.lower())
         return cleaned
 
     def _build_xlsx(self, parsed):
-        """
-        Build the XLSX on disk rather than entirely in RAM.
-
-        This is intentionally file-backed for a small VPS. The generated bytes
-        are only loaded after xlsxwriter has closed the workbook.
-        """
         rows = parsed["rows"]
         source_months = sorted(parsed["months"], reverse=True)
 
@@ -568,12 +592,10 @@ class DclDebtorsAgeWizard(models.TransientModel):
         os.close(fd)
 
         try:
-            workbook = xlsxwriter.Workbook(path)
+            workbook = xlsxwriter.Workbook(path, {"constant_memory": True})
 
-            fmt_title = workbook.add_format({
-                "bold": True,
-                "font_size": 16,
-            })
+            fmt_title = workbook.add_format({"bold": True, "font_size": 16})
+            fmt_subtitle = workbook.add_format({"italic": True})
             fmt_header = workbook.add_format({
                 "bold": True,
                 "border": 1,
@@ -587,17 +609,11 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "num_format": '#,##0.00;[Red]-#,##0.00',
                 "bg_color": "#C6EFCE",
             })
-            fmt_text_exception = workbook.add_format({
-                "bg_color": "#C6EFCE",
-            })
-            fmt_date = workbook.add_format({
-                "num_format": "dd-mmm-yyyy",
-            })
+            fmt_text_exception = workbook.add_format({"bg_color": "#C6EFCE"})
+            fmt_date = workbook.add_format({"num_format": "dd-mmm-yyyy"})
 
             # ---------------- Portfolio Summary ----------------
             summary = workbook.add_worksheet("Portfolio Summary")
-            summary.freeze_panes(4, 0)
-
             summary.write(0, 0, "DCL Debtors Age Analysis", fmt_title)
             summary.write(1, 0, "Reporting Date")
             if self.reporting_date:
@@ -607,160 +623,166 @@ class DclDebtorsAgeWizard(models.TransientModel):
                     datetime.combine(self.reporting_date, datetime.min.time()),
                     fmt_date,
                 )
+            summary.write(1, 3, "Source Worksheet")
+            summary.write(1, 4, parsed["sheet_name"])
+            summary.write(1, 6, "Build")
+            summary.write(1, 7, BUILD_VERSION)
 
             summary_headers = [
-                "Property",
+                "Property / Site Name",
                 "Debtors",
+                "Opening Arrears",
+                "Period Charges",
+                "Period Receipts",
                 "Current Outstanding",
-                "Exceptions",
             ]
-            for col, heading in enumerate(summary_headers):
-                summary.write(3, col, heading, fmt_header)
+            summary_headers += [m.strftime("%b %Y") for m in source_months]
+            summary_headers += ["Opening", "Exceptions"]
 
-            summary_row = 4
+            header_row = 3
+            for col, heading in enumerate(summary_headers):
+                summary.write(header_row, col, heading, fmt_header)
+            summary.freeze_panes(header_row + 1, 1)
+
+            out_row = header_row + 1
+            property_summaries = []
             for property_name in sorted(grouped, key=lambda x: x.lower()):
                 property_rows = grouped[property_name]
-                total = sum(
-                    float(item.get("current_outstanding") or 0.0)
-                    for item in property_rows
-                )
-                exceptions = sum(
-                    1 for item in property_rows if item.get("exception")
-                )
+                aged_totals = defaultdict(float)
+                for debtor in property_rows:
+                    for key, value in (debtor.get("ageing") or {}).items():
+                        aged_totals[key] += float(value or 0.0)
 
-                summary.write(summary_row, 0, property_name)
-                summary.write_number(summary_row, 1, len(property_rows))
-                summary.write_number(summary_row, 2, total, fmt_money)
-                summary.write_number(summary_row, 3, exceptions)
-                summary_row += 1
+                item = {
+                    "property": property_name,
+                    "debtors": len(property_rows),
+                    "opening": sum(float(x.get("opening_balance") or 0.0) for x in property_rows),
+                    "charges": sum(float(x.get("period_charges") or 0.0) for x in property_rows),
+                    "receipts": sum(float(x.get("period_receipts") or 0.0) for x in property_rows),
+                    "current": sum(float(x.get("current_outstanding") or 0.0) for x in property_rows),
+                    "aged": aged_totals,
+                    "exceptions": sum(1 for x in property_rows if x.get("exception")),
+                }
+                property_summaries.append(item)
 
-            summary.write(summary_row, 0, "TOTAL", fmt_header)
-            summary.write_number(summary_row, 1, len(rows), fmt_header)
-            summary.write_number(
-                summary_row,
-                2,
-                sum(float(item.get("current_outstanding") or 0.0) for item in rows),
-                fmt_money,
-            )
-            summary.write_number(
-                summary_row,
-                3,
-                sum(1 for item in rows if item.get("exception")),
+                summary.write(out_row, 0, item["property"])
+                summary.write_number(out_row, 1, item["debtors"])
+                summary.write_number(out_row, 2, item["opening"], fmt_money)
+                summary.write_number(out_row, 3, item["charges"], fmt_money)
+                summary.write_number(out_row, 4, item["receipts"], fmt_money)
+                summary.write_number(out_row, 5, item["current"], fmt_money)
+
+                col = 6
+                for month in source_months:
+                    summary.write_number(
+                        out_row,
+                        col,
+                        float(item["aged"].get(month.strftime("%b %Y"), 0.0) or 0.0),
+                        fmt_money,
+                    )
+                    col += 1
+                summary.write_number(
+                    out_row,
+                    col,
+                    float(item["aged"].get("Opening", 0.0) or 0.0),
+                    fmt_money,
+                )
+                col += 1
+                summary.write_number(out_row, col, item["exceptions"])
+                out_row += 1
+
+            summary.write(out_row, 0, "TOTAL", fmt_header)
+            summary.write_number(out_row, 1, len(rows), fmt_header)
+            for col in range(2, 6 + len(source_months) + 1):
+                first = xlsxwriter.utility.xl_rowcol_to_cell(header_row + 1, col)
+                last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, col)
+                summary.write_formula(
+                    out_row,
+                    col,
+                    "=SUM(%s:%s)" % (first, last),
+                    fmt_money,
+                )
+            exception_col = len(summary_headers) - 1
+            first = xlsxwriter.utility.xl_rowcol_to_cell(header_row + 1, exception_col)
+            last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, exception_col)
+            summary.write_formula(
+                out_row,
+                exception_col,
+                "=SUM(%s:%s)" % (first, last),
                 fmt_header,
             )
 
-            summary.set_column(0, 0, 32)
-            summary.set_column(1, 1, 12)
-            summary.set_column(2, 2, 20)
-            summary.set_column(3, 3, 12)
+            summary.autofilter(header_row, 0, out_row - 1, len(summary_headers) - 1)
+            summary.set_column(0, 0, 30)
+            summary.set_column(1, 1, 10)
+            summary.set_column(2, len(summary_headers) - 1, 17)
 
             # ---------------- Property sheets ----------------
             used_sheet_names = {"portfolio summary"}
-
             for property_name in sorted(grouped, key=lambda x: x.lower()):
                 property_rows = grouped[property_name]
-
                 sheet_name = self._safe_sheet_name(property_name, used_sheet_names)
                 ws = workbook.add_worksheet(sheet_name)
-                ws.freeze_panes(3, 3)
-                ws.autofilter(
-                    2,
-                    0,
-                    2 + max(len(property_rows), 1),
-                    8 + len(source_months),
-                )
-
                 ws.write(0, 0, property_name, fmt_title)
+                ws.write(
+                    1,
+                    0,
+                    "Ageing as at %s" % self.reporting_date.strftime("%d %B %Y"),
+                    fmt_subtitle,
+                )
 
                 headers = [
                     "Account ID",
                     "Debtor Name",
                     "Billing Frequency",
                     "Opening Balance",
-                    "Total Billings",
-                    "Total Receipts",
+                    "Period Charges",
+                    "Period Receipts",
                     "Current Outstanding",
                 ]
-
-                month_headers = [
-                    month.strftime("%b %Y") for month in source_months
-                ]
-
-                headers += month_headers
+                headers += [month.strftime("%b %Y") for month in source_months]
                 headers += [
                     "Opening / Older",
                     "Reconciliation Difference",
                     "Exception",
                 ]
 
+                header_row = 2
                 for col, heading in enumerate(headers):
-                    ws.write(2, col, heading, fmt_header)
+                    ws.write(header_row, col, heading, fmt_header)
+                ws.freeze_panes(header_row + 1, 3)
 
-                out_row = 3
-
+                out_row = header_row + 1
                 for debtor in property_rows:
                     exception = debtor.get("exception")
                     text_fmt = fmt_text_exception if exception else None
                     money_fmt = fmt_money_exception if exception else fmt_money
 
-                    ws.write(
-                        out_row,
-                        0,
-                        debtor.get("account_id", ""),
-                        text_fmt,
-                    )
-                    ws.write(
-                        out_row,
-                        1,
-                        debtor.get("debtor_name", ""),
-                        text_fmt,
-                    )
-                    ws.write(
-                        out_row,
-                        2,
-                        debtor.get("billing_frequency", ""),
-                        text_fmt,
-                    )
-
-                    ws.write_number(
-                        out_row,
-                        3,
-                        float(debtor.get("opening_balance") or 0.0),
-                        money_fmt,
-                    )
-                    ws.write_number(
-                        out_row,
-                        4,
-                        float(debtor.get("total_billings") or 0.0),
-                        money_fmt,
-                    )
-                    ws.write_number(
-                        out_row,
-                        5,
-                        float(debtor.get("total_receipts") or 0.0),
-                        money_fmt,
-                    )
-                    ws.write_number(
-                        out_row,
-                        6,
-                        float(debtor.get("current_outstanding") or 0.0),
-                        money_fmt,
-                    )
+                    ws.write(out_row, 0, debtor.get("account_id", ""), text_fmt)
+                    ws.write(out_row, 1, debtor.get("debtor_name", ""), text_fmt)
+                    ws.write(out_row, 2, debtor.get("billing_frequency", ""), text_fmt)
+                    ws.write_number(out_row, 3, float(debtor.get("opening_balance") or 0.0), money_fmt)
+                    ws.write_number(out_row, 4, float(debtor.get("period_charges") or 0.0), money_fmt)
+                    ws.write_number(out_row, 5, float(debtor.get("period_receipts") or 0.0), money_fmt)
+                    ws.write_number(out_row, 6, float(debtor.get("current_outstanding") or 0.0), money_fmt)
 
                     ageing = debtor.get("ageing") or {}
-
                     col = 7
                     for month in source_months:
-                        value = float(ageing.get(month, 0.0) or 0.0)
-                        ws.write_number(out_row, col, value, money_fmt)
+                        ws.write_number(
+                            out_row,
+                            col,
+                            float(ageing.get(month.strftime("%b %Y"), 0.0) or 0.0),
+                            money_fmt,
+                        )
                         col += 1
-
-                    older_value = float(
-                        ageing.get("opening", ageing.get("older", 0.0)) or 0.0
+                    ws.write_number(
+                        out_row,
+                        col,
+                        float(ageing.get("Opening", 0.0) or 0.0),
+                        money_fmt,
                     )
-                    ws.write_number(out_row, col, older_value, money_fmt)
                     col += 1
-
                     ws.write_number(
                         out_row,
                         col,
@@ -768,37 +790,34 @@ class DclDebtorsAgeWizard(models.TransientModel):
                         money_fmt,
                     )
                     col += 1
-
                     ws.write(
                         out_row,
                         col,
-                        "Yes" if exception else "",
+                        debtor.get("exception_message", "") if exception else "",
                         text_fmt,
                     )
-
                     out_row += 1
 
-                # Total row
+                # Total row.
                 ws.write(out_row, 0, "TOTAL", fmt_header)
+                for col in range(3, len(headers) - 1):
+                    first = xlsxwriter.utility.xl_rowcol_to_cell(header_row + 1, col)
+                    last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, col)
+                    ws.write_formula(
+                        out_row,
+                        col,
+                        "=SUM(%s:%s)" % (first, last),
+                        fmt_money,
+                    )
 
-                for col in range(3, 7 + len(source_months) + 2):
-                    if out_row > 3:
-                        first = xlsxwriter.utility.xl_rowcol_to_cell(3, col)
-                        last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, col)
-                        ws.write_formula(
-                            out_row,
-                            col,
-                            "=SUM(%s:%s)" % (first, last),
-                            fmt_money,
-                        )
-
-                ws.set_column(0, 0, 18)
+                ws.autofilter(header_row, 0, out_row - 1, len(headers) - 1)
+                ws.set_column(0, 0, 16)
                 ws.set_column(1, 1, 34)
                 ws.set_column(2, 2, 18)
-                ws.set_column(3, len(headers) - 1, 16)
+                ws.set_column(3, len(headers) - 2, 16)
+                ws.set_column(len(headers) - 1, len(headers) - 1, 44)
 
             workbook.close()
-
             with open(path, "rb") as handle:
                 return handle.read()
 
