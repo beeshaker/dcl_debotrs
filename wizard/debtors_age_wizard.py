@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import base64
+import calendar
 import io
 import math
 import os
@@ -27,7 +28,7 @@ from ..models.aging_engine import (
 )
 
 
-BUILD_VERSION = "2026.09.02-r6"
+BUILD_VERSION = "2026.09.02-r7-format"
 
 
 class DclDebtorsAgeWizard(models.TransientModel):
@@ -534,6 +535,9 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "reconciliation_difference": reconciliation_difference,
                 "exception": bool(calculation.exception),
                 "exception_message": calculation.exception or "",
+                # Retained so the final property report can reproduce the
+                # reference workbook's month-by-month balance snapshots.
+                "monthly_rows": monthly_rows,
             })
 
         return {
@@ -580,9 +584,73 @@ class DclDebtorsAgeWizard(models.TransientModel):
         used.add(cleaned.lower())
         return cleaned
 
+    @staticmethod
+    def _ordinal(day):
+        if 10 <= day % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        return "%s%s" % (day, suffix)
+
+    @staticmethod
+    def _month_end(month_date):
+        return date(
+            month_date.year,
+            month_date.month,
+            calendar.monthrange(month_date.year, month_date.month)[1],
+        )
+
+    def _debtor_snapshots(self, debtor, source_months):
+        """
+        Reproduce the reference workbook's per-debtor snapshot rows.
+
+        For each source month, calculate ageing using only transactions up to
+        that month. The current month uses the reporting date; prior months use
+        month-end dates. Balance is the source Current Bal for that period.
+        """
+        monthly_rows = sorted(
+            list(debtor.get("monthly_rows") or []),
+            key=lambda item: item["month"],
+        )
+
+        if not monthly_rows:
+            return []
+
+        snapshots = []
+
+        for idx in range(len(monthly_rows) - 1, -1, -1):
+            cutoff_row = monthly_rows[idx]
+            subset = monthly_rows[: idx + 1]
+
+            result = calculate_debtor_ageing(
+                debtor_id=debtor.get("account_id", ""),
+                debtor_name=debtor.get("debtor_name", ""),
+                property_name=debtor.get("property", ""),
+                monthly_rows=subset,
+                source_closing=cutoff_row.get("current_bal"),
+            )
+
+            cutoff_month = cutoff_row["month"]
+            snapshot_date = (
+                self.reporting_date
+                if idx == len(monthly_rows) - 1
+                else self._month_end(cutoff_month)
+            )
+
+            snapshots.append({
+                "date": snapshot_date,
+                "balance": float(cutoff_row.get("current_bal") or 0.0),
+                "aged": result.aged,
+                "exception": bool(result.exception),
+                "exception_message": result.exception or "",
+            })
+
+        return snapshots
+
     def _build_xlsx(self, parsed):
         rows = parsed["rows"]
         source_months = sorted(parsed["months"], reverse=True)
+        chronological_months = sorted(parsed["months"])
 
         grouped = defaultdict(list)
         for row in rows:
@@ -592,63 +660,313 @@ class DclDebtorsAgeWizard(models.TransientModel):
         os.close(fd)
 
         try:
-            workbook = xlsxwriter.Workbook(path, {"constant_memory": True})
+            workbook = xlsxwriter.Workbook(path)
 
-            fmt_title = workbook.add_format({"bold": True, "font_size": 16})
-            fmt_subtitle = workbook.add_format({"italic": True})
-            fmt_header = workbook.add_format({
+            navy = "#1E2761"
+            navy_2 = "#2A357A"
+            pale = "#F2F4F8"
+            pale_2 = "#E8EDF5"
+            white = "#FFFFFF"
+            green = "#92D050"
+
+            money_2dp = '#,##0.00;[Red](#,##0.00);-'
+            money_0dp = '#,##0;[Red]-#,##0;"-"'
+            date_fmt_code = "yyyy-mm-dd"
+
+            fmt_master_title = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 16,
                 "bold": True,
-                "border": 1,
-                "text_wrap": True,
+                "font_color": white,
+                "bg_color": navy,
+                "align": "center",
                 "valign": "vcenter",
             })
-            fmt_money = workbook.add_format({
-                "num_format": '#,##0.00;[Red]-#,##0.00',
+            fmt_master_subtitle = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "font_color": navy,
+                "bg_color": pale,
+                "align": "center",
+                "valign": "vcenter",
             })
-            fmt_money_exception = workbook.add_format({
-                "num_format": '#,##0.00;[Red]-#,##0.00',
-                "bg_color": "#C6EFCE",
+            fmt_kpi = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 11,
+                "bold": True,
+                "font_color": navy,
+                "bg_color": pale,
+                "align": "center",
+                "valign": "vcenter",
+                "text_wrap": True,
+                "border": 1,
+                "border_color": pale_2,
             })
-            fmt_text_exception = workbook.add_format({"bg_color": "#C6EFCE"})
-            fmt_date = workbook.add_format({"num_format": "dd-mmm-yyyy"})
+            fmt_summary_header = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "font_color": white,
+                "bg_color": navy_2,
+                "align": "center",
+                "valign": "vcenter",
+                "text_wrap": True,
+                "border": 1,
+                "border_color": white,
+            })
+            fmt_summary_text_odd = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": white,
+                "border": 1,
+                "border_color": pale_2,
+            })
+            fmt_summary_text_even = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": pale,
+                "border": 1,
+                "border_color": pale_2,
+            })
+            fmt_summary_int_odd = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": white,
+                "align": "right",
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": "#,##0",
+            })
+            fmt_summary_int_even = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": pale,
+                "align": "right",
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": "#,##0",
+            })
+            fmt_summary_money_odd = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": white,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": money_2dp,
+            })
+            fmt_summary_money_even = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": pale,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": money_2dp,
+            })
+            fmt_summary_current_odd = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "font_color": navy,
+                "bg_color": white,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": money_2dp,
+            })
+            fmt_summary_current_even = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "font_color": navy,
+                "bg_color": pale,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": money_2dp,
+            })
+            fmt_summary_green_text = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": green,
+                "border": 1,
+                "border_color": pale_2,
+            })
+            fmt_summary_green_int = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": green,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": "#,##0",
+            })
+            fmt_summary_green_money = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bg_color": green,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": money_2dp,
+            })
+            fmt_summary_green_current = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "font_color": navy,
+                "bg_color": green,
+                "border": 1,
+                "border_color": pale_2,
+                "num_format": money_2dp,
+            })
+
+            fmt_property_total = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 11,
+                "bold": True,
+                "font_color": navy,
+                "bg_color": pale,
+                "align": "center",
+                "valign": "vcenter",
+            })
+            fmt_property_header = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+            })
+            fmt_property_month_header = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "bg_color": pale,
+                "align": "center",
+            })
+            fmt_property_name = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "font_color": navy,
+            })
+            fmt_property_date = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 11,
+                "num_format": date_fmt_code,
+            })
+            fmt_property_balance = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "font_color": navy,
+                "num_format": money_0dp,
+            })
+            fmt_property_money = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 11,
+                "num_format": money_0dp,
+            })
+            fmt_property_frequency = workbook.add_format({
+                "font_name": "Calibri",
+                "font_size": 11,
+            })
 
             # ---------------- Portfolio Summary ----------------
             summary = workbook.add_worksheet("Portfolio Summary")
-            summary.write(0, 0, "DCL Debtors Age Analysis", fmt_title)
-            summary.write(1, 0, "Reporting Date")
-            if self.reporting_date:
-                summary.write_datetime(
-                    1,
-                    1,
-                    datetime.combine(self.reporting_date, datetime.min.time()),
-                    fmt_date,
-                )
-            summary.write(1, 3, "Source Worksheet")
-            summary.write(1, 4, parsed["sheet_name"])
-            summary.write(1, 6, "Build")
-            summary.write(1, 7, BUILD_VERSION)
+            summary.hide_gridlines(2)
+
+            total_receivables = sum(
+                float(item.get("current_outstanding") or 0.0)
+                for item in rows
+            )
+            total_collections = sum(
+                float(item.get("period_receipts") or 0.0)
+                for item in rows
+            )
+            total_charges = sum(
+                float(item.get("period_charges") or 0.0)
+                for item in rows
+            )
+            collection_efficiency = (
+                total_collections / total_charges
+                if abs(total_charges) > 0.005
+                else 0.0
+            )
+
+            summary.merge_range(
+                "A1:S1",
+                "PORTFOLIO DEBTORS AGING & RECONCILIATION MASTER SUMMARY",
+                fmt_master_title,
+            )
+            summary.merge_range(
+                "A2:S2",
+                "Reporting Date: %s  |  Currency: %s  |  Total Properties Monitored: %s"
+                % (
+                    self.reporting_date.strftime("%d %B %Y"),
+                    self.currency_id.name or "KES",
+                    len(grouped),
+                ),
+                fmt_master_subtitle,
+            )
+            summary.set_row(0, 28)
+            summary.set_row(1, 22)
+
+            summary.merge_range(
+                "B4:D5",
+                "Total Receivables\n%s %s"
+                % (self.currency_id.name or "KES", f"{total_receivables:,.2f}"),
+                fmt_kpi,
+            )
+            summary.merge_range(
+                "F4:H5",
+                "Monitored Sites\n%s Properties" % len(grouped),
+                fmt_kpi,
+            )
+            summary.merge_range(
+                "J4:L5",
+                "Total Active Debtors\n%s Debtors" % f"{len(rows):,}",
+                fmt_kpi,
+            )
+            summary.merge_range(
+                "N4:P5",
+                "Total Period Collections\n%s %s"
+                % (self.currency_id.name or "KES", f"{total_collections:,.2f}"),
+                fmt_kpi,
+            )
+            summary.merge_range(
+                "R4:S5",
+                "Collection Efficiency\n%s" % f"{collection_efficiency:.1%}",
+                fmt_kpi,
+            )
+
+            earliest = min(chronological_months)
+            previous_month_end = earliest - timedelta(days=1)
+            period_label = "%s-%s" % (
+                chronological_months[0].strftime("%b"),
+                chronological_months[-1].strftime("%b"),
+            )
 
             summary_headers = [
+                "#",
                 "Property / Site Name",
                 "Debtors",
-                "Opening Arrears",
-                "Period Charges",
-                "Period Receipts",
+                "Opening Arrears (%s)" % previous_month_end.strftime("%b %y"),
+                "Period Charges (%s)" % period_label,
+                "Period Receipts (%s)" % period_label,
                 "Current Outstanding",
             ]
             summary_headers += [m.strftime("%b %Y") for m in source_months]
             summary_headers += ["Opening", "Exceptions"]
 
-            header_row = 3
+            header_row = 6
             for col, heading in enumerate(summary_headers):
-                summary.write(header_row, col, heading, fmt_header)
-            summary.freeze_panes(header_row + 1, 1)
+                summary.write(header_row, col, heading, fmt_summary_header)
+            summary.set_row(header_row, 36)
+            summary.freeze_panes(header_row + 1, 2)
 
             out_row = header_row + 1
-            property_summaries = []
-            for property_name in sorted(grouped, key=lambda x: x.lower()):
+
+            for seq, property_name in enumerate(
+                sorted(grouped, key=lambda x: x.lower()),
+                start=1,
+            ):
                 property_rows = grouped[property_name]
                 aged_totals = defaultdict(float)
+
                 for debtor in property_rows:
                     for key, value in (debtor.get("ageing") or {}).items():
                         aged_totals[key] += float(value or 0.0)
@@ -663,161 +981,178 @@ class DclDebtorsAgeWizard(models.TransientModel):
                     "aged": aged_totals,
                     "exceptions": sum(1 for x in property_rows if x.get("exception")),
                 }
-                property_summaries.append(item)
 
-                summary.write(out_row, 0, item["property"])
-                summary.write_number(out_row, 1, item["debtors"])
-                summary.write_number(out_row, 2, item["opening"], fmt_money)
-                summary.write_number(out_row, 3, item["charges"], fmt_money)
-                summary.write_number(out_row, 4, item["receipts"], fmt_money)
-                summary.write_number(out_row, 5, item["current"], fmt_money)
+                has_exception = item["exceptions"] > 0
+                even = seq % 2 == 0
 
-                col = 6
+                if has_exception:
+                    text_fmt = fmt_summary_green_text
+                    int_fmt = fmt_summary_green_int
+                    money_fmt = fmt_summary_green_money
+                    current_fmt = fmt_summary_green_current
+                else:
+                    text_fmt = fmt_summary_text_even if even else fmt_summary_text_odd
+                    int_fmt = fmt_summary_int_even if even else fmt_summary_int_odd
+                    money_fmt = fmt_summary_money_even if even else fmt_summary_money_odd
+                    current_fmt = fmt_summary_current_even if even else fmt_summary_current_odd
+
+                summary.write_number(out_row, 0, seq, int_fmt)
+                summary.write(out_row, 1, item["property"], text_fmt)
+                summary.write_number(out_row, 2, item["debtors"], int_fmt)
+                summary.write_number(out_row, 3, item["opening"], money_fmt)
+                summary.write_number(out_row, 4, item["charges"], money_fmt)
+                summary.write_number(out_row, 5, item["receipts"], money_fmt)
+                summary.write_number(out_row, 6, item["current"], current_fmt)
+
+                col = 7
                 for month in source_months:
                     summary.write_number(
                         out_row,
                         col,
                         float(item["aged"].get(month.strftime("%b %Y"), 0.0) or 0.0),
-                        fmt_money,
+                        money_fmt,
                     )
                     col += 1
+
                 summary.write_number(
                     out_row,
                     col,
                     float(item["aged"].get("Opening", 0.0) or 0.0),
-                    fmt_money,
+                    money_fmt,
                 )
                 col += 1
-                summary.write_number(out_row, col, item["exceptions"])
+                summary.write_number(out_row, col, item["exceptions"], int_fmt)
                 out_row += 1
 
-            summary.write(out_row, 0, "TOTAL", fmt_header)
-            summary.write_number(out_row, 1, len(rows), fmt_header)
-            for col in range(2, 6 + len(source_months) + 1):
-                first = xlsxwriter.utility.xl_rowcol_to_cell(header_row + 1, col)
-                last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, col)
-                summary.write_formula(
-                    out_row,
-                    col,
-                    "=SUM(%s:%s)" % (first, last),
-                    fmt_money,
-                )
-            exception_col = len(summary_headers) - 1
-            first = xlsxwriter.utility.xl_rowcol_to_cell(header_row + 1, exception_col)
-            last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, exception_col)
-            summary.write_formula(
-                out_row,
-                exception_col,
-                "=SUM(%s:%s)" % (first, last),
-                fmt_header,
-            )
-
             summary.autofilter(header_row, 0, out_row - 1, len(summary_headers) - 1)
-            summary.set_column(0, 0, 30)
-            summary.set_column(1, 1, 10)
-            summary.set_column(2, len(summary_headers) - 1, 17)
+            summary.set_column("A:A", 5)
+            summary.set_column("B:B", 28)
+            summary.set_column("C:C", 10)
+            summary.set_column("D:G", 20)
+            summary.set_column("H:O", 14)
+            summary.set_column("P:P", 15)
+            summary.set_column("Q:Q", 12)
 
             # ---------------- Property sheets ----------------
             used_sheet_names = {"portfolio summary"}
+            final_month_labels = [
+                month.strftime("%b %Y") for month in source_months
+            ]
+
+            current_header = "%s %s" % (
+                self.reporting_date.strftime("%B"),
+                self._ordinal(self.reporting_date.day),
+            )
+            visible_age_headers = [current_header]
+            visible_age_headers += [
+                month.strftime("%B") for month in source_months[1:]
+            ]
+            visible_age_headers += [
+                "%s %s" % (
+                    chronological_months[0].strftime("%B"),
+                    self._ordinal(1),
+                )
+            ]
+
             for property_name in sorted(grouped, key=lambda x: x.lower()):
                 property_rows = grouped[property_name]
                 sheet_name = self._safe_sheet_name(property_name, used_sheet_names)
                 ws = workbook.add_worksheet(sheet_name)
-                ws.write(0, 0, property_name, fmt_title)
-                ws.write(
-                    1,
-                    0,
-                    "Ageing as at %s" % self.reporting_date.strftime("%d %B %Y"),
-                    fmt_subtitle,
-                )
+                ws.hide_gridlines(2)
 
-                headers = [
-                    "Account ID",
-                    "Debtor Name",
-                    "Billing Frequency",
-                    "Opening Balance",
-                    "Period Charges",
-                    "Period Receipts",
-                    "Current Outstanding",
-                ]
-                headers += [month.strftime("%b %Y") for month in source_months]
-                headers += [
-                    "Opening / Older",
-                    "Reconciliation Difference",
-                    "Exception",
-                ]
+                ws.merge_range("B1:K1", "Total Outstanding", fmt_property_total)
 
-                header_row = 2
-                for col, heading in enumerate(headers):
-                    ws.write(header_row, col, heading, fmt_header)
-                ws.freeze_panes(header_row + 1, 3)
+                ws.write("A2", "Tenant / Date", fmt_property_header)
+                ws.write("B2", "Balance", fmt_property_header)
 
-                out_row = header_row + 1
+                for idx, heading in enumerate(visible_age_headers):
+                    ws.write(1, 2 + idx, heading, fmt_property_month_header)
+
+                ws.write("M2", "Billing Frequency", fmt_property_header)
+                ws.freeze_panes(2, 2)
+
+                ws.set_column("A:A", 22)
+                ws.set_column("B:B", 17)
+                ws.set_column("C:D", 14)
+                ws.set_column("E:J", 12)
+                ws.set_column("K:K", 13)
+                ws.set_column("L:L", 3)
+                ws.set_column("M:M", 18)
+
+                out_row = 2
+
                 for debtor in property_rows:
-                    exception = debtor.get("exception")
-                    text_fmt = fmt_text_exception if exception else None
-                    money_fmt = fmt_money_exception if exception else fmt_money
+                    debtor_name = debtor.get("debtor_name", "")
+                    frequency = debtor.get("billing_frequency", "")
+                    account_id = debtor.get("account_id", "")
 
-                    ws.write(out_row, 0, debtor.get("account_id", ""), text_fmt)
-                    ws.write(out_row, 1, debtor.get("debtor_name", ""), text_fmt)
-                    ws.write(out_row, 2, debtor.get("billing_frequency", ""), text_fmt)
-                    ws.write_number(out_row, 3, float(debtor.get("opening_balance") or 0.0), money_fmt)
-                    ws.write_number(out_row, 4, float(debtor.get("period_charges") or 0.0), money_fmt)
-                    ws.write_number(out_row, 5, float(debtor.get("period_receipts") or 0.0), money_fmt)
-                    ws.write_number(out_row, 6, float(debtor.get("current_outstanding") or 0.0), money_fmt)
+                    ws.write(out_row, 0, debtor_name, fmt_property_name)
+                    if account_id:
+                        ws.write_comment(
+                            out_row,
+                            0,
+                            "Account ID: %s" % account_id,
+                            {"author": "DCL Debtors Age Analysis"},
+                        )
+                    ws.write(out_row, 12, frequency, fmt_property_frequency)
 
-                    ageing = debtor.get("ageing") or {}
-                    col = 7
-                    for month in source_months:
+                    for col in range(2, 11):
+                        ws.write_blank(out_row, col, None, fmt_property_money)
+
+                    snapshots = self._debtor_snapshots(debtor, source_months)
+
+                    for snapshot in snapshots:
+                        out_row += 1
+                        ws.write_datetime(
+                            out_row,
+                            0,
+                            datetime.combine(snapshot["date"], datetime.min.time()),
+                            fmt_property_date,
+                        )
                         ws.write_number(
                             out_row,
-                            col,
-                            float(ageing.get(month.strftime("%b %Y"), 0.0) or 0.0),
-                            money_fmt,
+                            1,
+                            snapshot["balance"],
+                            fmt_property_balance,
                         )
-                        col += 1
-                    ws.write_number(
-                        out_row,
-                        col,
-                        float(ageing.get("Opening", 0.0) or 0.0),
-                        money_fmt,
-                    )
-                    col += 1
-                    ws.write_number(
-                        out_row,
-                        col,
-                        float(debtor.get("reconciliation_difference") or 0.0),
-                        money_fmt,
-                    )
-                    col += 1
-                    ws.write(
-                        out_row,
-                        col,
-                        debtor.get("exception_message", "") if exception else "",
-                        text_fmt,
-                    )
-                    out_row += 1
 
-                # Total row.
-                ws.write(out_row, 0, "TOTAL", fmt_header)
-                for col in range(3, len(headers) - 1):
-                    first = xlsxwriter.utility.xl_rowcol_to_cell(header_row + 1, col)
-                    last = xlsxwriter.utility.xl_rowcol_to_cell(out_row - 1, col)
-                    ws.write_formula(
-                        out_row,
-                        col,
-                        "=SUM(%s:%s)" % (first, last),
-                        fmt_money,
-                    )
+                        aged = snapshot["aged"] or {}
 
-                ws.autofilter(header_row, 0, out_row - 1, len(headers) - 1)
-                ws.set_column(0, 0, 16)
-                ws.set_column(1, 1, 34)
-                ws.set_column(2, 2, 18)
-                ws.set_column(3, len(headers) - 2, 16)
-                ws.set_column(len(headers) - 1, len(headers) - 1, 44)
+                        col = 2
+                        for month_label in final_month_labels:
+                            ws.write_number(
+                                out_row,
+                                col,
+                                float(aged.get(month_label, 0.0) or 0.0),
+                                fmt_property_money,
+                            )
+                            col += 1
+
+                        ws.write_number(
+                            out_row,
+                            10,
+                            float(aged.get("Opening", 0.0) or 0.0),
+                            fmt_property_money,
+                        )
+                        ws.write(out_row, 12, frequency, fmt_property_frequency)
+
+                        if snapshot.get("exception_message"):
+                            ws.write_comment(
+                                out_row,
+                                1,
+                                snapshot["exception_message"],
+                                {"author": "DCL Debtors Age Analysis"},
+                            )
+
+                    out_row += 5
+
+                ws.set_landscape()
+                ws.fit_to_pages(1, 0)
+                ws.repeat_rows(0, 1)
+                ws.set_margins(left=0.25, right=0.25, top=0.4, bottom=0.4)
 
             workbook.close()
+
             with open(path, "rb") as handle:
                 return handle.read()
 
