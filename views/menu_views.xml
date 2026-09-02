@@ -1,10 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
 
-    <!-- ==========================================================
-         ROOT APPLICATION MENU
-         ========================================================== -->
-
     <menuitem
         id="menu_dcl_debtors_age_root"
         name="Debtors Ageing"
@@ -12,16 +8,9 @@
         groups="base.group_user"
     />
 
-    <!-- Explicitly clear any action that may have been manually
-         assigned to the root menu in Developer Mode -->
     <record id="menu_dcl_debtors_age_root" model="ir.ui.menu">
         <field name="action" eval="False"/>
     </record>
-
-
-    <!-- ==========================================================
-         GENERATE AGE ANALYSIS
-         ========================================================== -->
 
     <menuitem
         id="menu_dcl_debtors_age_generate"
