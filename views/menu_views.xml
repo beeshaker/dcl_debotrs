@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <menuitem id="menu_dcl_debtors_age_root" name="Debtors Ageing" sequence="80"/>
+    <menuitem id="menu_dcl_debtors_age_generate" name="Generate Age Analysis" parent="menu_dcl_debtors_age_root" action="action_dcl_debtors_age_wizard" sequence="10"/>
+</odoo>
