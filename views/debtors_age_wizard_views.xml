@@ -4,8 +4,8 @@
     <record id="view_dcl_debtors_age_wizard_form" model="ir.ui.view">
         <field name="name">dcl.debtors.age.wizard.form</field>
         <field name="model">dcl.debtors.age.wizard</field>
-        <field name="arch" type="xml">
 
+        <field name="arch" type="xml">
             <form string="Generate Debtors Age Analysis">
 
                 <sheet>
@@ -21,6 +21,7 @@
                     <group>
 
                         <group string="Source">
+
                             <field
                                 name="source_file"
                                 filename="source_filename"
@@ -41,43 +42,27 @@
                                 name="source_sheet"
                                 placeholder="Auto-detect"
                             />
-                        </group>
 
+                        </group>
 
                         <group
                             string="Results"
                             invisible="not result_file"
                         >
 
-                            <field
-                                name="currency_id"
-                                readonly="1"
-                            />
+                            <field name="currency_id" readonly="1"/>
 
-                            <field
-                                name="property_count"
-                                readonly="1"
-                            />
+                            <field name="property_count" readonly="1"/>
 
-                            <field
-                                name="debtor_count"
-                                readonly="1"
-                            />
+                            <field name="debtor_count" readonly="1"/>
 
-                            <field
-                                name="exception_count"
-                                readonly="1"
-                            />
+                            <field name="exception_count" readonly="1"/>
 
-                            <field
-                                name="total_receivables"
-                                readonly="1"
-                            />
+                            <field name="total_receivables" readonly="1"/>
 
                         </group>
 
                     </group>
-
 
                     <group
                         string="Generation Result"
@@ -104,7 +89,6 @@
                     </group>
 
                 </sheet>
-
 
                 <footer>
 
@@ -141,35 +125,16 @@
                 </footer>
 
             </form>
-
         </field>
     </record>
 
 
-    <record
-        id="action_dcl_debtors_age_wizard"
-        model="ir.actions.act_window"
-    >
-
+    <record id="action_dcl_debtors_age_wizard" model="ir.actions.act_window">
         <field name="name">Debtors Age Analysis</field>
-
-        <field name="res_model">
-            dcl.debtors.age.wizard
-        </field>
-
-        <field name="view_mode">
-            form
-        </field>
-
-        <field
-            name="view_id"
-            ref="view_dcl_debtors_age_wizard_form"
-        />
-
-        <field name="target">
-            new
-        </field>
-
+        <field name="res_model">dcl.debtors.age.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="view_id" ref="view_dcl_debtors_age_wizard_form"/>
+        <field name="target">new</field>
     </record>
 
 </odoo>
