@@ -5,7 +5,7 @@ import math
 import os
 import tempfile
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from odoo import api, fields, models, _
 from odoo.exceptions import UserError, ValidationError
@@ -171,71 +171,6 @@ class DclDebtorsAgeWizard(models.TransientModel):
         )
 
     @staticmethod
-    def _parse_month_value(value):
-        """
-        Parse month markers from the Dunhill Debtors List.
-
-        Handles:
-        - Text values such as "AUGUST 2026 ."
-        - datetime/date values
-        - Excel serial dates
-        """
-        if value in (None, ""):
-            return None
-
-        if isinstance(value, datetime):
-            return value.date().replace(day=1)
-
-        if isinstance(value, date):
-            return value.replace(day=1)
-
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            try:
-                serial = float(value)
-                if 20000 <= serial <= 80000:
-                    parsed = date(1899, 12, 30) + timedelta(days=int(serial))
-                    return parsed.replace(day=1)
-            except Exception:
-                pass
-
-        text = str(value).strip()
-        if not text:
-            return None
-
-        cleaned = (
-            text
-            .replace(".", " ")
-            .replace(",", " ")
-            .strip()
-        )
-        cleaned = " ".join(cleaned.split())
-
-        for fmt in (
-            "%B %Y",
-            "%b %Y",
-            "%Y-%m",
-            "%m/%Y",
-            "%m-%Y",
-            "%B-%Y",
-            "%b-%Y",
-        ):
-            try:
-                return datetime.strptime(cleaned, fmt).date().replace(day=1)
-            except ValueError:
-                continue
-
-        try:
-            parsed = parse_month(value)
-            if parsed:
-                if isinstance(parsed, datetime):
-                    parsed = parsed.date()
-                return parsed.replace(day=1)
-        except Exception:
-            pass
-
-        return None
-
-    @staticmethod
     def _row_values(ws, row_number):
         """
         Read one row sequentially.
@@ -253,27 +188,25 @@ class DclDebtorsAgeWizard(models.TransientModel):
 
     def _score_sheet(self, ws):
         """
-        Score sheets based on month blocks and transaction headings.
+        Score a sheet based on month headers / ledger labels in its first rows.
+        This only touches the first few rows, so it remains cheap.
         """
         first = self._row_values(ws, 1)
         second = self._row_values(ws, 2)
 
         score = 0
 
-        # Months in the actual workbook are mainly on row 2.
-        for value in list(first) + list(second):
-            if self._parse_month_value(value):
+        for value in first:
+            if parse_month(value):
                 score += 4
 
         expected = {
             "arrears b f",
-            "arrears bf",
             "rent levy",
             "recoveries",
             "adjustments",
             "receipts",
             "current bal",
-            "current balance",
             "opening balance",
             "total billings",
             "total receipts",
@@ -346,17 +279,28 @@ class DclDebtorsAgeWizard(models.TransientModel):
 
     def _build_column_map(self, header1, header2):
         """
-        Detect the monthly six-column ledger blocks.
+        Build all column indexes once from the two header rows.
 
-        Actual source structure:
-        Row 1 -> Arrears B/f | Rent / Levy | Recoveries | Adjustments | Receipts | Current Bal
-        Row 2 -> AUGUST 2026 . | blank | blank | blank | blank | blank
+        Returns:
+            {
+                "months": {
+                    date(2026, 8, 1): {
+                        "arrears": 3,
+                        "rent": 4,
+                        ...
+                    }
+                },
+                "summary": {
+                    "opening_balance": 52,
+                    ...
+                }
+            }
 
-        The month is therefore detected from row 2 first, then applied to the
-        following transaction headings until the next month marker appears.
+        Indexes are zero-based because rows are tuples.
         """
         months = {}
         summary = {}
+
         current_month = None
 
         field_aliases = {
@@ -383,72 +327,27 @@ class DclDebtorsAgeWizard(models.TransientModel):
 
         for idx in range(width):
             top = header1[idx] if idx < len(header1) else None
-            bottom = header2[idx] if idx < len(header2) else None
+            sub = header2[idx] if idx < len(header2) else None
 
-            month = (
-                self._parse_month_value(bottom)
-                or self._parse_month_value(top)
-            )
-
-            if month:
-                current_month = month.replace(day=1)
-                months.setdefault(current_month, {})
+            parsed_month = parse_month(top)
+            if parsed_month:
+                current_month = parsed_month.replace(day=1)
 
             top_norm = normalize_header(top)
-            bottom_norm = normalize_header(bottom)
+            sub_norm = normalize_header(sub)
 
             if top_norm in summary_aliases:
                 summary[summary_aliases[top_norm]] = idx
-            if bottom_norm in summary_aliases:
-                summary[summary_aliases[bottom_norm]] = idx
+            if sub_norm in summary_aliases:
+                summary[summary_aliases[sub_norm]] = idx
 
-            field_name = (
-                field_aliases.get(top_norm)
-                or field_aliases.get(bottom_norm)
-            )
+            field_name = field_aliases.get(sub_norm) or field_aliases.get(top_norm)
 
             if current_month and field_name:
                 months.setdefault(current_month, {})[field_name] = idx
 
-        required_fields = {
-            "arrears",
-            "rent_levy",
-            "recoveries",
-            "adjustments",
-            "receipts",
-            "current_balance",
-        }
-
-        valid_months = {}
-
-        for month, columns in months.items():
-            found = required_fields.intersection(columns.keys())
-            if len(found) >= 3:
-                valid_months[month] = columns
-
-        valid_months = dict(sorted(valid_months.items()))
-
-        if not valid_months:
-            debug_values = []
-
-            for idx in range(width):
-                top = header1[idx] if idx < len(header1) else None
-                bottom = header2[idx] if idx < len(header2) else None
-
-                if top not in (None, "") or bottom not in (None, ""):
-                    debug_values.append(
-                        "%s: [%r] / [%r]" % (idx + 1, top, bottom)
-                    )
-
-            raise UserError(
-                _(
-                    "Monthly columns could not be detected.\n\n"
-                    "Detected headers:\n%s"
-                ) % "\n".join(debug_values[:80])
-            )
-
         return {
-            "months": valid_months,
+            "months": dict(sorted(months.items())),
             "summary": summary,
         }
 
