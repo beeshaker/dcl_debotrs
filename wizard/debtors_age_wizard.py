@@ -762,26 +762,6 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "border_color": pale_2,
                 "num_format": money_2dp,
             })
-            fmt_summary_current_odd = workbook.add_format({
-                "font_name": "Calibri",
-                "font_size": 10,
-                "bold": True,
-                "font_color": navy,
-                "bg_color": white,
-                "border": 1,
-                "border_color": pale_2,
-                "num_format": money_2dp,
-            })
-            fmt_summary_current_even = workbook.add_format({
-                "font_name": "Calibri",
-                "font_size": 10,
-                "bold": True,
-                "font_color": navy,
-                "bg_color": pale,
-                "border": 1,
-                "border_color": pale_2,
-                "num_format": money_2dp,
-            })
             fmt_summary_green_text = workbook.add_format({
                 "font_name": "Calibri",
                 "font_size": 10,
@@ -805,17 +785,6 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "border_color": pale_2,
                 "num_format": money_2dp,
             })
-            fmt_summary_green_current = workbook.add_format({
-                "font_name": "Calibri",
-                "font_size": 10,
-                "bold": True,
-                "font_color": navy,
-                "bg_color": green,
-                "border": 1,
-                "border_color": pale_2,
-                "num_format": money_2dp,
-            })
-
             fmt_property_total = workbook.add_format({
                 "font_name": "Calibri",
                 "font_size": 11,
@@ -847,13 +816,6 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "font_name": "Calibri",
                 "font_size": 11,
                 "num_format": date_fmt_code,
-            })
-            fmt_property_balance = workbook.add_format({
-                "font_name": "Calibri",
-                "font_size": 10,
-                "bold": True,
-                "font_color": navy,
-                "num_format": money_0dp,
             })
             fmt_property_money = workbook.add_format({
                 "font_name": "Calibri",
@@ -947,7 +909,6 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 "Opening Arrears (%s)" % previous_month_end.strftime("%b %y"),
                 "Period Charges (%s)" % period_label,
                 "Period Receipts (%s)" % period_label,
-                "Current Outstanding",
             ]
             summary_headers += [m.strftime("%b %Y") for m in source_months]
             summary_headers += ["Opening", "Exceptions"]
@@ -977,7 +938,6 @@ class DclDebtorsAgeWizard(models.TransientModel):
                     "opening": sum(float(x.get("opening_balance") or 0.0) for x in property_rows),
                     "charges": sum(float(x.get("period_charges") or 0.0) for x in property_rows),
                     "receipts": sum(float(x.get("period_receipts") or 0.0) for x in property_rows),
-                    "current": sum(float(x.get("current_outstanding") or 0.0) for x in property_rows),
                     "aged": aged_totals,
                     "exceptions": sum(1 for x in property_rows if x.get("exception")),
                 }
@@ -989,12 +949,10 @@ class DclDebtorsAgeWizard(models.TransientModel):
                     text_fmt = fmt_summary_green_text
                     int_fmt = fmt_summary_green_int
                     money_fmt = fmt_summary_green_money
-                    current_fmt = fmt_summary_green_current
                 else:
                     text_fmt = fmt_summary_text_even if even else fmt_summary_text_odd
                     int_fmt = fmt_summary_int_even if even else fmt_summary_int_odd
                     money_fmt = fmt_summary_money_even if even else fmt_summary_money_odd
-                    current_fmt = fmt_summary_current_even if even else fmt_summary_current_odd
 
                 summary.write_number(out_row, 0, seq, int_fmt)
                 summary.write(out_row, 1, item["property"], text_fmt)
@@ -1002,9 +960,8 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 summary.write_number(out_row, 3, item["opening"], money_fmt)
                 summary.write_number(out_row, 4, item["charges"], money_fmt)
                 summary.write_number(out_row, 5, item["receipts"], money_fmt)
-                summary.write_number(out_row, 6, item["current"], current_fmt)
 
-                col = 7
+                col = 6
                 for month in source_months:
                     summary.write_number(
                         out_row,
@@ -1028,10 +985,10 @@ class DclDebtorsAgeWizard(models.TransientModel):
             summary.set_column("A:A", 5)
             summary.set_column("B:B", 28)
             summary.set_column("C:C", 10)
-            summary.set_column("D:G", 20)
-            summary.set_column("H:O", 14)
-            summary.set_column("P:P", 15)
-            summary.set_column("Q:Q", 12)
+            summary.set_column("D:F", 20)
+            summary.set_column("G:N", 14)
+            summary.set_column("O:O", 15)
+            summary.set_column("P:P", 12)
 
             # ---------------- Property sheets ----------------
             used_sheet_names = {"portfolio summary"}
@@ -1060,24 +1017,22 @@ class DclDebtorsAgeWizard(models.TransientModel):
                 ws = workbook.add_worksheet(sheet_name)
                 ws.hide_gridlines(2)
 
-                ws.merge_range("B1:K1", "Total Outstanding", fmt_property_total)
+                ws.merge_range("B1:J1", "Total Outstanding", fmt_property_total)
 
                 ws.write("A2", "Tenant / Date", fmt_property_header)
-                ws.write("B2", "Balance", fmt_property_header)
 
                 for idx, heading in enumerate(visible_age_headers):
-                    ws.write(1, 2 + idx, heading, fmt_property_month_header)
+                    ws.write(1, 1 + idx, heading, fmt_property_month_header)
 
-                ws.write("M2", "Billing Frequency", fmt_property_header)
-                ws.freeze_panes(2, 2)
+                ws.write("L2", "Billing Frequency", fmt_property_header)
+                ws.freeze_panes(2, 1)
 
                 ws.set_column("A:A", 22)
-                ws.set_column("B:B", 17)
-                ws.set_column("C:D", 14)
-                ws.set_column("E:J", 12)
-                ws.set_column("K:K", 13)
-                ws.set_column("L:L", 3)
-                ws.set_column("M:M", 18)
+                ws.set_column("B:C", 14)
+                ws.set_column("D:I", 12)
+                ws.set_column("J:J", 13)
+                ws.set_column("K:K", 3)
+                ws.set_column("L:L", 18)
 
                 out_row = 2
 
@@ -1094,9 +1049,9 @@ class DclDebtorsAgeWizard(models.TransientModel):
                             "Account ID: %s" % account_id,
                             {"author": "DCL Debtors Age Analysis"},
                         )
-                    ws.write(out_row, 12, frequency, fmt_property_frequency)
+                    ws.write(out_row, 11, frequency, fmt_property_frequency)
 
-                    for col in range(2, 11):
+                    for col in range(1, 10):
                         ws.write_blank(out_row, col, None, fmt_property_money)
 
                     snapshots = self._debtor_snapshots(debtor, source_months)
@@ -1109,16 +1064,9 @@ class DclDebtorsAgeWizard(models.TransientModel):
                             datetime.combine(snapshot["date"], datetime.min.time()),
                             fmt_property_date,
                         )
-                        ws.write_number(
-                            out_row,
-                            1,
-                            snapshot["balance"],
-                            fmt_property_balance,
-                        )
-
                         aged = snapshot["aged"] or {}
 
-                        col = 2
+                        col = 1
                         for month_label in final_month_labels:
                             ws.write_number(
                                 out_row,
@@ -1130,16 +1078,16 @@ class DclDebtorsAgeWizard(models.TransientModel):
 
                         ws.write_number(
                             out_row,
-                            10,
+                            9,
                             float(aged.get("Opening", 0.0) or 0.0),
                             fmt_property_money,
                         )
-                        ws.write(out_row, 12, frequency, fmt_property_frequency)
+                        ws.write(out_row, 11, frequency, fmt_property_frequency)
 
                         if snapshot.get("exception_message"):
                             ws.write_comment(
                                 out_row,
-                                1,
+                                0,
                                 snapshot["exception_message"],
                                 {"author": "DCL Debtors Age Analysis"},
                             )
