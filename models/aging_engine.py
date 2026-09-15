@@ -152,9 +152,24 @@ def calculate_debtor_ageing(debtor_id, debtor_name, property_name, monthly_rows,
     period_charges = 0.0
     period_receipts = 0.0
 
-    for row in rows:
+    for index, row in enumerate(rows):
         label = row["month"].strftime("%b %Y")
         balances[label] = balances.get(label, 0.0)
+
+        # Source ledgers restate "Arrears B/f" every month rather than simply
+        # echoing the prior month's Current Bal. When the restated figure
+        # disagrees with the balance we have carried forward (write-offs,
+        # transfers, corrections applied outside the tracked columns), treat
+        # the gap as an implicit adjustment against the oldest (Opening)
+        # bucket so the running total stays reconciled to the source.
+        if index > 0:
+            stated_arrears = as_number(row.get("arrears_bf"))
+            carried = sum(max(v, 0.0) for v in balances.values()) - unapplied_credit
+            gap = stated_arrears - carried
+            if gap > 0.005:
+                unapplied_credit = _apply_charge(balances, "Opening", gap, unapplied_credit)
+            elif gap < -0.005:
+                unapplied_credit += _apply_credit(balances, -gap)
 
         rent = as_number(row.get("rent_levy"))
         recoveries = as_number(row.get("recoveries"))
